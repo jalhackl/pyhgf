@@ -1,10 +1,10 @@
 # Author: Nicolas Legrand <nicolas.legrand@cas.au.dk>
 
 from functools import partial
-from typing import Dict
 
 import jax.numpy as jnp
 from jax import Array, jit
+
 from pyhgf.typing import Edges
 
 #
@@ -22,29 +22,29 @@ from jax import lax
 
 @partial(jit, static_argnames=("edges", "node_idx"))
 def predict_mean(
-    attributes: Dict,
+    attributes: dict,
     edges: Edges,
     node_idx: int,
 ) -> Array:
     r"""Compute the expected mean of a continuous state node.
 
     The expected mean at time :math:`k` for a state node :math:`a` with optional value
-    parent(s) :math:`b` is given by:
+    parent(s) :math:`b` is in [1]_ given by:
 
     .. math::
 
         \hat{\mu}_a^{(k)} = \lambda_a \mu_a^{(k-1)} + P_a^{(k)}
 
-    where :math:`P_a^{(k)}` is the drift rate (the total predicted drift of the mean,
-    which sums the tonic and - optionally - phasic drifts). The variable
+    where :math:`P_a^{(k)}` is the drift rate (the total predicted drift of the expected
+    mean, which sums the tonic and - optionally - phasic drifts). The variable
     :math:`lambda_a` represents the state's autoconnection strength, with
-    :math:`\lambda_a \in [0, 1]`. When :math:`lambda_a = 1`, the node is performing a
-    Gaussian Random Walk using the value :math:` P_a^{(k)}` as total drift rate. When
+    :math:`\lambda_a \in [0, 1]`. When :math:`\lambda_a = 1`, the node is performing a
+    Gaussian Random Walk using the value :math:`P_a^{(k)}` as total drift rate. When
     :math:`\lambda_a < 1`, the state will revert back to the total mean :math:`M_a`,
     which is given by:
 
     .. math::
-            M_a = \frac{\rho_a + f\left(x_b^{(k)}\right)} {1-\lambda_a},
+            M_a = \frac{\rho_a + f\left(\hat{\mu}_b^{(k)}\right)} {1-\lambda_a},
 
     If :math:`\lambda_a = 0`, the node is not influenced by its own mean anymore, but
     by the value received by the value parent.
@@ -99,9 +99,11 @@ def predict_mean(
             child_position = edges[value_parent_idx].value_children.index(node_idx)
             coupling_fn = edges[value_parent_idx].coupling_fn[child_position]
             if coupling_fn is None:
-                parent_value = attributes[value_parent_idx]["mean"]
+                parent_value = attributes[value_parent_idx]["expected_mean"]
             else:
-                parent_value = coupling_fn(attributes[value_parent_idx]["mean"])
+                parent_value = coupling_fn(
+                    attributes[value_parent_idx]["expected_mean"]
+                )
 
             driftrate += psi * parent_value
 
@@ -114,10 +116,13 @@ def predict_mean(
 
 
 @partial(jit, static_argnames=("edges", "node_idx"))
-def predict_precision(attributes: Dict, edges: Edges, node_idx: int) -> Array:
+def predict_precision(
+    attributes: dict, edges: Edges, node_idx: int
+) -> tuple[Array, Array]:
     r"""Compute the expected precision of a continuous state node.
 
-    The expected precision at time :math:`k` for a state node :math:`a` is given by:
+    The expected precision at time :math:`k` for a state node :math:`a` is given by
+    [1]_:
 
     .. math::
 
@@ -129,7 +134,7 @@ def predict_precision(attributes: Dict, edges: Edges, node_idx: int) -> Array:
     .. math::
 
         \Omega_a^{(k)} = t^{(k)}
-        \exp{ \left( \omega_a + \sum_{j=1}^{N_{vopa}} \kappa_j \mu_a^{(k-1)} \right) }
+        \exp{ \left( \omega_a + \sum_{j=1}^{N_{vopa}} \kappa_j \hat{\mu}_a^{(k-1)} \right) }
 
 
     with :math:`\kappa_j` the volatility coupling strength with the volatility parent
@@ -187,7 +192,8 @@ def predict_precision(attributes: Dict, edges: Edges, node_idx: int) -> Array:
             attributes[node_idx]["volatility_coupling_parents"],
         ):
             total_volatility += (
-                volatility_coupling * attributes[volatility_parents_idx]["mean"]
+                volatility_coupling
+                * attributes[volatility_parents_idx]["expected_mean"]
             )
 
     # compute the predicted_volatility from the total volatility
@@ -207,21 +213,23 @@ def predict_precision(attributes: Dict, edges: Edges, node_idx: int) -> Array:
     return expected_precision, effective_precision
 
 
-@partial(jit, static_argnames=("edges", "node_idx"))
-def continuous_node_prediction_standard(
-    attributes: Dict, node_idx: int, edges: Edges, **args
-) -> Dict:
-    """Update the expected mean and expected precision of a continuous node.
+#standard function
+def continuous_node_prediction_default(
+    attributes: dict, node_idx: int, edges: Edges, **args
+) -> dict:
+    """Update the expected mean and expected precision of a continuous node [1]_.
 
     Parameters
     ----------
     attributes :
         The attributes of the probabilistic nodes.
+
     .. note::
         The parameter structure also incorporates the value and volatility coupling
         strength with children and parents (i.e. `"value_coupling_parents"`,
         `"value_coupling_children"`, `"volatility_coupling_parents"`,
         `"volatility_coupling_children"`).
+
     node_idx :
         Pointer to the node that will be updated.
     edges :
@@ -280,25 +288,24 @@ def continuous_node_prediction_standard(
     return attributes
 
 
-
-
 # new: adding 'forget' functionality for multiple, partially masked inputs
-
 @partial(jit, static_argnames=("edges", "node_idx"))
 def continuous_node_prediction(
-    attributes: Dict, node_idx: int, edges: Edges, **args
-) -> Dict:
-    """Update the expected mean and expected precision of a continuous node.
+    attributes: dict, node_idx: int, edges: Edges, **args
+) -> dict:
+    """Update the expected mean and expected precision of a continuous node [1]_.
 
     Parameters
     ----------
     attributes :
         The attributes of the probabilistic nodes.
+
     .. note::
         The parameter structure also incorporates the value and volatility coupling
         strength with children and parents (i.e. `"value_coupling_parents"`,
         `"value_coupling_children"`, `"volatility_coupling_parents"`,
         `"volatility_coupling_children"`).
+
     node_idx :
         Pointer to the node that will be updated.
     edges :
@@ -323,7 +330,6 @@ def continuous_node_prediction(
        arXiv. https://doi.org/10.48550/ARXIV.2305.10937
 
     """
-
     # if this node has volatility parent(s), store the current variance
     # to be used by the posterior update if using unbounded approximation
     attributes[node_idx]["temp"]["current_variance"] = (
@@ -337,8 +343,8 @@ def continuous_node_prediction(
     expected_precision, effective_precision = predict_precision(
         attributes, edges, node_idx
     )
-
-
+    
+    ###################################################
     #NEW - mode 4 is working fine, 0 (none) is default
     mode_map = {"none": 0, "hgf_decay": 1, "regret_decay": 2, "regret_additive_precision": 3, "regret_additive_mult": 4}
 
@@ -481,8 +487,13 @@ def continuous_node_prediction(
         expected_mean,
     )
 
+    
+    #############################################
+    
+    
+    
 
-    # Update current node's parameters
+    # Update this node's parameters
 
     # 1. input node without volatility parent
     if (

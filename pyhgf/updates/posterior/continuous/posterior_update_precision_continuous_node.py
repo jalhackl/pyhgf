@@ -10,6 +10,18 @@ from jax.tree_util import Partial
 from pyhgf.typing import Edges
 
 
+#
+from typing import Dict
+from typing import TYPE_CHECKING, List, Tuple
+from pyhgf.typing import Sequence
+
+import jax.numpy as jnp
+from jax import grad, jit
+from jax.lax import cond
+from jax.tree_util import Partial
+from jax import lax
+
+
 @partial(jit, static_argnames=("edges", "node_idx"))
 def posterior_update_precision_continuous_node(
     attributes: dict,
@@ -35,7 +47,7 @@ def posterior_update_precision_continuous_node(
     was computed beforehand by
     :py:func:`pyhgf.updates.prediction_errors.continuous.continuous_node_value_prediction_error`.
 
-    For non-linear value coupling:
+    For non-linear value coupling we use equation 50 from [1]_.:
 
     .. math::
 
@@ -107,8 +119,8 @@ def posterior_update_precision_continuous_node(
     References
     ----------
     .. [1] Weber, L. A., Waade, P. T., Legrand, N., Møller, A. H., Stephan, K. E., &
-       Mathys, C. (2023). The generalized Hierarchical Gaussian Filter (Version 1).
-       arXiv. https://doi.org/10.48550/ARXIV.2305.10937
+       Mathys, C. (2026). The generalized Hierarchical Gaussian Filter. eLife Sciences
+       Publications, Ltd. https://doi.org/10.7554/elife.110174.1
 
     """
     # ----------------------------------------------------------------------------------
@@ -169,7 +181,8 @@ def precision_update(attributes: dict, edges: Edges, node_idx: int) -> Array:
     precision_weigthed_prediction_error = 0.0
 
     # Value coupling updates - update the precision of a value parent
-    # ---------------------------------------------------------------
+    # Using eq. 50 from Weber et al. (2026)
+    # ----------------------------------------------------------------------------------
     if edges[node_idx].value_children is not None:
         for value_child_idx, value_coupling, coupling_fn in zip(
             edges[node_idx].value_children,  # type: ignore
@@ -177,28 +190,31 @@ def precision_update(attributes: dict, edges: Edges, node_idx: int) -> Array:
             edges[node_idx].coupling_fn,
         ):
             if coupling_fn is None:  # linear coupling
-                coupling_fn_prime = 1
+                coupling_fn_prime = value_coupling**2
                 coupling_fn_second = 0
             else:  # non-linear coupling
-                coupling_fn_prime = grad(coupling_fn)(attributes[node_idx]["mean"]) ** 2
+                coupling_fn_prime = (
+                    value_coupling**2
+                    * grad(coupling_fn)(attributes[node_idx]["mean"]) ** 2
+                )
                 value_prediction_error = attributes[value_child_idx]["temp"][
                     "value_prediction_error"
                 ]
                 coupling_fn_second = (
-                    grad(grad(coupling_fn))(attributes[node_idx]["mean"])
+                    value_coupling
+                    * grad(grad(coupling_fn))(attributes[node_idx]["mean"])
                     * value_prediction_error
                 )
 
             # cancel the prediction error if the child value was not observed
             precision_weigthed_prediction_error += (
-                value_coupling**2
-                * attributes[value_child_idx]["expected_precision"]
-                * coupling_fn_prime
-                - coupling_fn_second
-            ) * attributes[value_child_idx]["observed"]
+                attributes[value_child_idx]["expected_precision"]
+                * (coupling_fn_prime - coupling_fn_second)
+                * attributes[value_child_idx]["observed"]
+            )
 
     # Volatility coupling updates - update the precision of a volatility parent
-    # -------------------------------------------------------------------------
+    # ----------------------------------------------------------------------------------
     if edges[node_idx].volatility_children is not None:
         for volatility_child_idx, volatility_coupling in zip(
             edges[node_idx].volatility_children,  # type: ignore
@@ -242,7 +258,7 @@ def precision_update(attributes: dict, edges: Edges, node_idx: int) -> Array:
 
 @partial(jit, static_argnames=("edges", "node_idx"))
 def precision_update_missing_values(
-    attributes: dict, edges: Edges, node_idx: int
+    attributes: dict, edges: Edges, node_idx: int, time_multiplier = 1
 ) -> float:
     """Compute new precision in the case of missing observations.
 
@@ -284,10 +300,18 @@ def precision_update_missing_values(
             total_volatility += (
                 volatility_coupling * attributes[volatility_parents_idx]["mean"]
             )
+            
+            
+            
+    #get time multiplier if in attributes
+    if "forget" in attributes[node_idx]:
+        time_multiplier = attributes[node_idx]["forget"]
+    else:
+        print("forget not in attributes")
 
     # compute the new predicted_volatility from the total volatility
     time_step = attributes[-1]["time_step"]
-    predicted_volatility = time_step * jnp.exp(total_volatility)
+    predicted_volatility = time_step * jnp.exp(total_volatility) * time_multiplier
 
     # Estimate the new precision for the continuous state node
     posterior_precision_missing_values = 1 / (

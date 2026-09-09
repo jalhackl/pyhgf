@@ -69,6 +69,133 @@ def add_continuous_state(
     return network
 
 
+def add_volatile_state(
+    network: Network,
+    n_nodes: int,
+    value_parents: tuple,
+    value_children: tuple,
+    node_parameters: dict,
+    additional_parameters: dict,
+    coupling_fn: tuple[Optional[Callable], ...],
+):
+    """Add a continuous state node with an implicit continuous volatility parent.
+
+    This node type combines a continuous node with an implicit volatility parent. The
+    volatility parent modulates the child's precision, enabling dynamic learning rates
+    in predictive coding networks with fewer explicit nodes.
+
+    note::
+        Parameters relative to the volatility level (e.g., "mean_vol",
+        "expected_mean_vol", etc.) are included in the node's attributes using the
+        suffix "_vol".
+    """
+    node_type = 6
+
+    # Value-volatility nodes cannot have external volatility parents/children
+    # The volatility coupling is internal
+    volatility_parents = (None, None)
+    volatility_children = (None, None)
+
+    default_parameters = {
+        # Value level parameters (external facing)
+        "mean": 0.0,
+        "expected_mean": 0.0,
+        "precision": 1.0,
+        "expected_precision": 1.0,
+        "tonic_volatility": -4.0,
+        "autoconnection_strength": 0.0,
+        # Volatility level parameters (implicit internal)
+        "mean_vol": 0.0,
+        "expected_mean_vol": 0.0,
+        "precision_vol": 1.0,
+        "expected_precision_vol": 1.0,
+        "tonic_volatility_vol": -4.0,
+        # Internal coupling
+        "volatility_coupling_internal": 1.0,
+        # External coupling (value only)
+        "value_coupling_children": value_children[1],
+        "value_coupling_parents": value_parents[1],
+        # State
+        "temp": {
+            "effective_precision": 0.0,
+            "value_prediction_error": 0.0,
+            "volatility_prediction_error": 0.0,
+            "effective_precision_vol": 0.0,
+            "current_variance": 1.0,
+        },
+    }
+
+    node_parameters = update_parameters(
+        node_parameters, default_parameters, additional_parameters
+    )
+
+    network = insert_nodes(
+        network=network,
+        n_nodes=n_nodes,
+        node_type=node_type,
+        node_parameters=node_parameters,
+        value_parents=value_parents,
+        volatility_parents=volatility_parents,
+        value_children=value_children,
+        volatility_children=volatility_children,
+        coupling_fn=coupling_fn,
+    )
+
+    return network
+
+
+def add_constant_state(
+    network: Network,
+    n_nodes: int,
+    value_children: tuple,
+    volatility_children: tuple,
+    node_parameters: dict,
+    coupling_fn: tuple[Optional[Callable], ...],
+):
+    """Add constant-state (bias) node(s) to a network.
+
+    Constant-state nodes hold a fixed mean of 1.0 and precision of 1.0 (fully known
+    bias). They are always wired to their children linearly (``coupling_fn`` is forced
+    to ``None``), have no prediction or update steps, and can only have children, never
+    parents.
+    """
+    # Validate that constant-state nodes cannot have volatility children
+    if volatility_children[0] is not None and len(volatility_children[0]) > 0:
+        raise ValueError("Constant-state nodes cannot have volatility children. ")
+
+    node_type = 0
+
+    default_parameters = {
+        "mean": 1.0,
+        "expected_mean": 1.0,
+        "precision": 1.0,
+        "expected_precision": 1.0,
+        "value_coupling_children": value_children[1],
+    }
+
+    # allow caller overrides
+    default_parameters.update(node_parameters)
+
+    # Constant-state nodes are always linearly connected to their children;
+    # any caller-supplied coupling function is dropped to preserve the
+    # bias = 1.0 invariant across backends.
+    coupling_fn = tuple(None for _ in coupling_fn)
+
+    network = insert_nodes(
+        network=network,
+        n_nodes=n_nodes,
+        node_type=node_type,
+        node_parameters=default_parameters,
+        value_parents=(None, None),
+        volatility_parents=(None, None),
+        value_children=value_children,
+        volatility_children=volatility_children,
+        coupling_fn=coupling_fn,
+    )
+
+    return network
+
+
 def add_binary_state(
     network: Network,
     n_nodes: int,
@@ -383,7 +510,7 @@ def insert_nodes(
         # for mutiple value children, set a default tuple with corresponding length
 
         if children_number != len(coupling_fn):
-            if coupling_fn == (None,):
+            if len(coupling_fn) == 1:
                 coupling_fn = children_number * coupling_fn
             else:
                 raise ValueError(

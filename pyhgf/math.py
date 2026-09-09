@@ -4,6 +4,7 @@ from typing import Union
 
 import jax.numpy as jnp
 from jax import Array
+from jax.nn import sigmoid
 from jax.scipy.special import digamma, gamma, gammaln
 from jax.typing import ArrayLike
 
@@ -26,7 +27,7 @@ class MultivariateNormal:
     def sufficient_statistics_from_parameters(
         mean: ArrayLike, covariance: ArrayLike
     ) -> Array:
-        """Compute the expected sufficient statistics from distribution parameter.
+        """Compute the expected sufficient statistics from the distribution parameter.
 
         Parameters
         ----------
@@ -90,13 +91,15 @@ class Normal:
     """
 
     @staticmethod
-    def sufficient_statistics_from_observations(x: float) -> Array:
+    def sufficient_statistics_from_observations(x: ArrayLike) -> Array:
         """Compute the expected sufficient statistics from a single observation."""
         return jnp.array([x, x**2])
 
     @staticmethod
-    def sufficient_statistics_from_parameters(mean: float, variance: float) -> Array:
-        """Compute the expected sufficient statistics from distribution parameter.
+    def sufficient_statistics_from_parameters(
+        mean: ArrayLike, variance: ArrayLike
+    ) -> Array:
+        """Compute the expected sufficient statistics from the distribution parameter.
 
         Parameters
         ----------
@@ -114,12 +117,12 @@ class Normal:
         return jnp.array([mean, mean**2 + variance])
 
     @staticmethod
-    def base_measure() -> float:
+    def base_measure() -> Array:
         """Compute the base measure of the univariate normal."""
         return 1 / (jnp.sqrt(2 * jnp.pi))
 
     @staticmethod
-    def parameters_from_sufficient_statistics(xis: ArrayLike) -> tuple[float, float]:
+    def parameters_from_sufficient_statistics(xis: ArrayLike) -> tuple[Array, Array]:
         """Compute the distribution parameters from the sufficient statistics.
 
         Parameters
@@ -139,7 +142,9 @@ class Normal:
         return mean, variance
 
 
-def gaussian_predictive_distribution(x: float, xi: ArrayLike, nu: float) -> float:
+def gaussian_predictive_distribution(
+    x: ArrayLike, xi: ArrayLike, nu: ArrayLike
+) -> Array:
     r"""Density of the Gaussian-predictive distribution.
 
     This distribution is parametrized by hyperparameters from the exponential family as:
@@ -163,7 +168,7 @@ def gaussian_predictive_distribution(x: float, xi: ArrayLike, nu: float) -> floa
     xi :
         Hyperparameter updated by the sufficient statistics of the observed variables.
     nu :
-        Hyperparameter over the number of valid observation (pseudo-counts).
+        Hyperparameter over the number of valid observations (pseudo-counts).
 
     Returns
     -------
@@ -194,11 +199,13 @@ def gaussian_density(x: ArrayLike, mean: ArrayLike, precision: ArrayLike) -> Arr
 
 
 def binary_surprise(
-    x: Union[float, ArrayLike], expected_mean: Union[float, ArrayLike]
+    x: ArrayLike,
+    expected_mean: ArrayLike,
+    clipping: bool = True,
 ) -> Array:
     r"""Surprise at a binary outcome.
 
-    The surprise ellicited by a binary observation :math:`x` under the expected
+    The surprise elicited by a binary observation :math:`x` under the expected
     probability :math:`\hat{\mu}` is given by:
 
     .. math::
@@ -214,6 +221,9 @@ def binary_surprise(
         The outcome.
     expected_mean :
         The mean of the Bernoulli distribution.
+    clipping :
+        If `True` (default), the expected mean is clipped in a reasonable range to
+        avoid numerical instabilities.
 
     Returns
     -------
@@ -228,15 +238,18 @@ def binary_surprise(
     `Array(0.35667497, dtype=float32, weak_type=True)`
 
     """
+    if clipping:
+        expected_mean = jnp.clip(expected_mean, 1e-6, 1 - 1e-6)
+
     return jnp.where(
         x, -jnp.log(expected_mean), -jnp.log(jnp.array(1.0) - expected_mean)
     )
 
 
 def gaussian_surprise(
-    x: Union[float, ArrayLike],
-    expected_mean: Union[float, ArrayLike],
-    expected_precision: Union[float, ArrayLike],
+    x: ArrayLike,
+    expected_mean: ArrayLike,
+    expected_precision: ArrayLike,
 ) -> Array:
     r"""Surprise at an outcome under a Gaussian prediction.
 
@@ -356,6 +369,40 @@ def binary_surprise_finite_precision(
     )
 
 
-def sigmoid_inverse_temperature(x: float, temperature: float) -> float:
+def sigmoid_inverse_temperature(x: ArrayLike, temperature: ArrayLike) -> Array:
     """Compute the sigmoid response function with inverse temperature parameter."""
     return (x**temperature) / (x**temperature + (1 - x) ** temperature)
+
+
+def parametrised_sigmoid(x: ArrayLike, theta: ArrayLike, phi: ArrayLike) -> Array:
+    r"""Compute the sigmoid parametrised by :math:`\phi` and :math:`\theta`."""
+    return sigmoid(phi * (x - theta))
+
+
+def smoothed_rectangular(
+    x: ArrayLike,
+    theta_l: ArrayLike,
+    phi_l: ArrayLike = 8.0,
+    theta_r: ArrayLike = 0.0,
+    phi_r: ArrayLike = 1.0,
+):
+    """Compute the smoothed rectangular weighting function :math:`b`."""
+    return parametrised_sigmoid(x, theta_l, phi_l) * (
+        1 - parametrised_sigmoid(x, theta_r, phi_r)
+    )
+
+
+def lambert_w0(z: ArrayLike) -> Array:
+    """Principal branch of the Lambert W function for z >= 0.
+
+    Solves ``w * exp(w) = z`` via 6 Halley iterations, which yields machine
+    precision for all z >= 0.
+    """
+    w = jnp.log(z + 1.0)
+    for _ in range(6):
+        ew = jnp.exp(w)
+        f = w * ew - z
+        f1 = (w + 1.0) * ew
+        f2 = (w + 2.0) * ew
+        w = w - (2.0 * f * f1) / (2.0 * f1**2 - f * f2)
+    return w

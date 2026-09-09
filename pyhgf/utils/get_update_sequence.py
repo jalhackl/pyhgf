@@ -14,9 +14,13 @@ from pyhgf.updates.posterior.continuous import (
 from pyhgf.updates.posterior.exponential import (
     posterior_update_exponential_family_dynamic,
 )
+from pyhgf.updates.posterior.volatile import (
+    volatile_node_posterior_update,
+)
 from pyhgf.updates.prediction.binary import binary_state_node_prediction
 from pyhgf.updates.prediction.continuous import continuous_node_prediction
 from pyhgf.updates.prediction.dirichlet import dirichlet_node_prediction
+from pyhgf.updates.prediction.volatile import volatile_node_prediction
 from pyhgf.updates.prediction_error.binary import binary_state_node_prediction_error
 from pyhgf.updates.prediction_error.categorical import (
     categorical_state_prediction_error,
@@ -26,6 +30,9 @@ from pyhgf.updates.prediction_error.dirichlet import dirichlet_node_prediction_e
 from pyhgf.updates.prediction_error.exponential import (
     prediction_error_update_exponential_family_dynamic,
     prediction_error_update_exponential_family_fixed,
+)
+from pyhgf.updates.prediction_error.volatile import (
+    volatile_node_prediction_error,
 )
 
 if TYPE_CHECKING:
@@ -76,6 +83,7 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
             (network.edges[i].value_children is None)
             & (network.edges[i].volatility_children is None)
         )
+        and network.edges[i].node_type != 0  # constant-state: no update
     ]
 
     # do not update continuous nodes that are parents of an ef state node
@@ -90,7 +98,7 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
 
         # for all nodes that should apply prediction update ----------------------------
         # verify that all children have computed the prediction error
-        for idx in nodes_without_prediction:
+        for idx in list(nodes_without_prediction):
             all_parents = [
                 i
                 for idx in [
@@ -111,6 +119,8 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
                     prediction_sequence.append((idx, continuous_node_prediction))
                 elif network.edges[idx].node_type == 4:
                     prediction_sequence.append((idx, dirichlet_node_prediction))
+                elif network.edges[idx].node_type == 6:
+                    prediction_sequence.append((idx, volatile_node_prediction))
 
         if not nodes_without_prediction:
             break
@@ -129,7 +139,7 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
         # for all nodes that should apply posterior update -----------------------------
         # verify that all children have computed the prediction error
         update_fn = None
-        for idx in nodes_without_posterior_update:
+        for idx in list(nodes_without_posterior_update):
             all_children = [
                 i
                 for idx in [
@@ -158,6 +168,16 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
                         update_fn = continuous_node_posterior_update
                     else:
                         raise ValueError("Invalid update type.")
+                    update_fn = Partial(
+                        update_fn,
+                        max_posterior_precision=network.max_posterior_precision,
+                    )
+
+                elif network.edges[idx].node_type == 6:
+                    update_fn = Partial(
+                        volatile_node_posterior_update,
+                        max_posterior_precision=network.max_posterior_precision,
+                    )
 
                 elif network.edges[idx].node_type == 4:
                     update_fn = None
@@ -168,7 +188,7 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
         # for all nodes that should apply prediction error------------------------------
         # verify that all children have been updated
         update_fn = None
-        for idx in nodes_without_prediction_error:
+        for idx in list(nodes_without_prediction_error):
             all_parents = [
                 i
                 for idx in [
@@ -181,7 +201,10 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
 
             # if this node has no parent, no need to compute prediction errors
             # unless this is an exponential family state node with fixed learning rate
-            if len(all_parents) == 0:
+            # or a volatile-state node (which updates its own volatility level).
+            # Volatile-state nodes must wait for their value-level posterior update first
+            # (same ordering rule as nodes with parents).
+            if len(all_parents) == 0 and network.edges[idx].node_type != 6:
                 if network.edges[idx].node_type == 3:
                     # retrieve the desired sufficient statistics function
                     # from the side parameter dictionary
@@ -238,6 +261,14 @@ def get_update_sequence(network: "Network", update_type: str) -> UpdateSequence:
 
                         # add the update here, this will move at the end of the sequence
                         update_sequence.append((idx, categorical_state_update))
+
+                    elif network.edges[idx].node_type == 6:
+                        update_fn = Partial(
+                            volatile_node_prediction_error,
+                            update_type=update_type,
+                            max_posterior_precision=network.max_posterior_precision,
+                        )
+
                     else:
                         raise ValueError(f"Invalid node type encountered at node {idx}")
 

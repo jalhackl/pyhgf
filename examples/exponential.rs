@@ -3,11 +3,14 @@ use rshgf::model::Network;
 fn main() {
 
     // initialize network
-    let mut network = Network::new();
+    let mut network = Network::new("eHGF");
 
     // create a network with two exponential family state nodes
     network.add_nodes(
         "exponential-state",
+        1,
+        None,
+        None,
         None,
         None,
         None,
@@ -15,8 +18,8 @@ fn main() {
     );
 
     // belief propagation
-    let input_data = vec![1.0, 1.3, 1.5, 1.7];
+    let input_data: Vec<Vec<f64>> = vec![vec![1.0], vec![1.3], vec![1.5], vec![1.7]];
     network.set_update_sequence();
-    network.input_data(input_data);
+    network.input_data(input_data, None, true);
 
 }

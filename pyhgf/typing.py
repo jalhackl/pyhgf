@@ -1,7 +1,10 @@
 # Author: Nicolas Legrand <nicolas.legrand@cas.au.dk>
+# Author: Aleksandrs Baskakovs <aleks@cas.au.dk>
 
 from typing import Callable, NamedTuple, Optional, Union
 
+import jax.numpy as jnp
+from jax import Array
 from jaxlib.xla_extension import PjitFunction
 
 
@@ -50,7 +53,7 @@ class UpdateSequence(NamedTuple):
 
 
 class LearningSequence(NamedTuple):
-    """Set of update functions to apply to the network."""
+    """Set of update functions to update the weights of a deep network."""
 
     prediction_steps: Sequence
     update_steps: Sequence
@@ -59,3 +62,135 @@ class LearningSequence(NamedTuple):
 
 # a fully defined network
 NetworkParameters = tuple[Attributes, Edges, UpdateSequence]
+
+
+class LayerState(NamedTuple):
+    """State for all nodes in a layer. All arrays have shape (n_nodes,).
+
+    This represents the state of a volatile node layer with both value level (external)
+    and volatility level (internal) variables.
+    """
+
+    # Value level (external)
+    mean: Array
+    precision: Array
+    expected_mean: Array
+    expected_precision: Array
+    effective_precision: Array
+    value_prediction_error: Array
+
+    # Volatility level (internal) - for volatile nodes
+    mean_vol: Array
+    precision_vol: Array
+    expected_mean_vol: Array
+    expected_precision_vol: Array
+    effective_precision_vol: Array
+    volatility_prediction_error: Array
+
+    @classmethod
+    def create(cls, n_nodes: int) -> "LayerState":
+        """Create a LayerState with default initialization.
+
+        Parameters
+        ----------
+        n_nodes :
+            Number of nodes in the layer.
+
+        Returns
+        -------
+        LayerState
+            Initialized layer state with zeros for means/errors
+            and ones for precisions.
+        """
+        return cls(
+            # Value level
+            mean=jnp.zeros(n_nodes),
+            precision=jnp.ones(n_nodes),
+            expected_mean=jnp.zeros(n_nodes),
+            expected_precision=jnp.ones(n_nodes),
+            effective_precision=jnp.zeros(n_nodes),
+            value_prediction_error=jnp.zeros(n_nodes),
+            # Volatility level
+            mean_vol=jnp.zeros(n_nodes),
+            precision_vol=jnp.ones(n_nodes),
+            expected_mean_vol=jnp.zeros(n_nodes),
+            expected_precision_vol=jnp.ones(n_nodes),
+            effective_precision_vol=jnp.zeros(n_nodes),
+            volatility_prediction_error=jnp.zeros(n_nodes),
+        )
+
+
+class LayerParams(NamedTuple):
+    """Static parameters for a layer. All arrays have shape (n_nodes,).
+
+    These parameters control the volatility dynamics of the layer.
+    """
+
+    tonic_volatility: Array  # Value level tonic volatility
+    tonic_volatility_vol: Array  # Volatility level tonic volatility
+    volatility_coupling: Array  # Internal volatility coupling strength
+    autoconnection_strength_vol: Array  # Implied volatility parent autoconnection
+
+    @classmethod
+    def create(
+        cls,
+        n_nodes: int,
+        tonic_volatility: float = -4.0,
+        tonic_volatility_vol: float = -4.0,
+        volatility_coupling: float = 1.0,
+        autoconnection_strength_vol: float = 1.0,
+    ) -> "LayerParams":
+        """Create LayerParams with specified values.
+
+        Parameters
+        ----------
+        n_nodes :
+            Number of nodes in the layer.
+        tonic_volatility :
+            Value level tonic volatility (log scale).
+        tonic_volatility_vol :
+            Volatility level tonic volatility (log scale).
+        volatility_coupling :
+            Internal volatility coupling strength.
+        autoconnection_strength_vol :
+            Autoconnection strength of the implied volatility parent. The
+            volatility-level expected mean is computed as
+            ``autoconnection_strength_vol * mean_vol``. Defaults to ``1.0``
+            (random walk on the volatility level).
+
+        Returns
+        -------
+        LayerParams
+            Initialized layer parameters.
+        """
+        return cls(
+            tonic_volatility=jnp.full(n_nodes, tonic_volatility),
+            tonic_volatility_vol=jnp.full(n_nodes, tonic_volatility_vol),
+            volatility_coupling=jnp.full(n_nodes, volatility_coupling),
+            autoconnection_strength_vol=jnp.full(n_nodes, autoconnection_strength_vol),
+        )
+
+
+class NetworkState(NamedTuple):
+    """Complete network state.
+
+    This represents the full state of a vectorized deep network, including all layer
+    states, inter-layer weights, and parameters.
+    """
+
+    layers: tuple  # tuple[LayerState, ...] - Layer 0 = output, Layer N = input
+    weights: tuple  # tuple[Array, ...] - weights[i] connects layer[i] to layer[i+1]
+    params: tuple  # tuple[LayerParams, ...] - params[i] for layer[i]
+    time_step: float
+    adam_m: tuple  # tuple[Array, ...] - first moment estimates (same shapes as weights)
+    adam_v: tuple  # tuple[Array, ...] - second moment estimates
+    adam_t: int  # global timestep counter
+
+    @property
+    def n_layers(self) -> int:
+        """Number of layers in the network."""
+        return len(self.layers)
+
+    def get_layer_sizes(self) -> list:
+        """Get the size of each layer."""
+        return [layer.mean.shape[0] for layer in self.layers]

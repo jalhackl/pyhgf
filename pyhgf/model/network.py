@@ -1,11 +1,13 @@
 # Author: Nicolas Legrand <nicolas.legrand@cas.au.dk>
 
+from __future__ import annotations
+
 from typing import Callable, Optional, Union
 
 import jax.numpy as jnp
 import numpy as np
 import pandas as pd
-from jax import random
+from jax import random, vmap
 from jax.lax import scan, switch
 from jax.tree_util import Partial
 from jax.typing import ArrayLike
@@ -13,9 +15,11 @@ from jax.typing import ArrayLike
 from pyhgf.model import (
     add_binary_state,
     add_categorical_state,
+    add_constant_state,
     add_continuous_state,
     add_dp_state,
     add_ef_state,
+    add_volatile_state,
     get_couplings,
 )
 from pyhgf.plots import graphviz, matplotlib, networkx
@@ -27,13 +31,14 @@ from pyhgf.typing import (
     Sequence,
     UpdateSequence,
 )
-from pyhgf.updates.learning import learning_weights_dynamic, learning_weights_fixed
+from pyhgf.updates.learning import learning_weights
 from pyhgf.utils import (
     add_edges,
     beliefs_propagation,
     get_input_idxs,
     get_update_sequence,
     learning,
+    predict_step,
     sample,
     to_pandas,
 )
@@ -67,7 +72,11 @@ class Network:
 
     """
 
-    def __init__(self, update_type: str = "eHGF") -> None:
+    def __init__(
+        self,
+        update_type: str = "eHGF",
+        max_posterior_precision: float = 1e10,
+    ) -> None:
         """Initialize an empty neural network.
 
         Parameters
@@ -84,6 +93,12 @@ class Network:
             .. note:
               The different update steps only apply to nodes having at least one
               volatility parents. In other cases, the regular HGF updates are applied.
+        max_posterior_precision :
+            Upper bound applied to every posterior precision write (value level for
+            continuous/volatile nodes and the implicit volatility level for volatile
+            nodes). Defaults to ``1e10`` and is shared with the vectorized JAX and Rust
+            backends. Increase it to relax the cap, or lower it to be more conservative
+            against precision blow-up.
 
         """
         self.edges: Edges = ()
@@ -99,6 +114,7 @@ class Network:
         self.action_steps: Optional[Sequence] = None
         self.last_attributes: Optional[Attributes] = None
         self.update_type = update_type
+        self.max_posterior_precision = float(max_posterior_precision)
 
     @property
     def input_idxs(self):
@@ -114,6 +130,10 @@ class Network:
             if self.edges[idx].node_type == 2:
                 self.attributes[idx]["autoconnection_strength"] = 0.0
                 self.attributes[idx]["tonic_volatility"] = 0.0
+            # ``observed`` is read by the propagation step on every input node.
+            # Node kinds whose defaults don't declare it (e.g. volatile-state)
+            # default to 1 here so the scan-carry pytree stays consistent.
+            self.attributes[idx].setdefault("observed", 1)
 
         return input_idxs
 
@@ -176,15 +196,17 @@ class Network:
 
     def create_learning_propagation_fn(
         self,
-        inputs_x_idxs: tuple[int],
-        inputs_y_idxs: tuple[int],
+        inputs_x_idxs: tuple[int, ...],
+        inputs_y_idxs: tuple[int, ...],
         overwrite: bool = True,
         lr: Union[str, float] = 0.2,
+        learning_kind: str = "precision_weighted",
+        params: Optional[dict] = None,
     ) -> "Network":
         """Create the belief propagation function.
 
         .. note:
-           This step is called by default when using py:meth:`input_data`.
+           This step is called by default when using py:meth:`fit`.
 
         Parameters
         ----------
@@ -197,7 +219,16 @@ class Network:
             preexisting values. Otherwise, do not create a new function if the attribute
             `scan_fn` is already defined.
         lr :
-            The kind of learning to use for the coupling strengths.
+            How the gradient is applied: a non-negative float for direct scaling, or
+            ``"adam"`` for the Adam optimiser.  Applied uniformly across all
+            *learning_kind* values, including ``"precision_ratio"``.
+        learning_kind :
+            Gradient computation mode: ``"standard"``, ``"precision_weighted"``
+            (default), or ``"precision_ratio"``.
+        params :
+            Dictionary of Adam hyper-parameters (used only when ``lr="adam"``):
+            ``beta1`` (default 0.9), ``beta2`` (default 0.999), ``epsilon``
+            (default 1e-8), and ``lr`` (default 1e-3, the Adam step size).
 
         """
         # get the dimension of the input nodes
@@ -211,26 +242,58 @@ class Network:
             )
         # create the learning sequence
         # all nodes except the prediction nodes should update their coupling strengths
-        if lr == "dynamic":
-            learning_weights = learning_weights_dynamic
+        use_adam = lr == "adam"
+        if use_adam:
+            p = params or {}
+            adam_lr = p.get("lr", 1e-3)
+            learn_fn = Partial(
+                learning_weights,
+                kind=learning_kind,
+                lr=adam_lr,
+                adam_beta1=p.get("beta1", 0.9),
+                adam_beta2=p.get("beta2", 0.999),
+                adam_epsilon=p.get("epsilon", 1e-8),
+            )
         elif isinstance(lr, float):
-            learning_weights = Partial(learning_weights_fixed, lr=lr)
+            learn_fn = Partial(learning_weights, kind=learning_kind, lr=lr)
         else:
-            raise ValueError("Invalid lr value. Should be 'dynamic' or a float value.")
-
-        learning_steps = [
-            (node_idx, learning_weights)
-            for node_idx, _ in self.update_sequence.prediction_steps
-            if (node_idx not in inputs_x_idxs)
-            and (self.edges[node_idx].volatility_children is None)
-        ]
+            raise ValueError(
+                f"Invalid lr value '{lr}'. Expected a non-negative float or 'adam'."
+            )
 
         # do not update the last layer
-        update_steps = tuple([
+        update_steps = [
             step
             for step in self.update_sequence.update_steps
             if step[0] not in inputs_x_idxs
-        ])
+        ]
+
+        # the learning steps should apply weight learning
+        # in the same order than the prediction errors occure
+        # continuous-state (2), volatile-state (6), and binary-state (1) nodes
+        # are eligible. binary-state uses sigmoid coupling in the weight update.
+        # Constant-state nodes (node_type 0) cannot have parents, so they are excluded.
+        learning_steps = []  # list of weight update to perform at this layer
+        for i, update in enumerate(update_steps):
+            fn = update[1]
+            fn_name: str = getattr(fn, "__name__", "") or getattr(
+                getattr(fn, "func", None), "__name__", ""
+            )
+            if fn is not None and "prediction_error" in fn_name:
+                node_idx = update[0]
+                # Skip constant-state nodes (they cannot have parents)
+                if self.edges[node_idx].node_type == 0:
+                    continue
+                # Skip nodes without value parents (nothing to learn)
+                if self.edges[node_idx].value_parents is None:
+                    continue
+                if self.edges[node_idx].node_type in {
+                    1,
+                    2,
+                    6,
+                }:  # binary-state, continuous-state, volatile-state
+                    learning_steps.append((node_idx, learn_fn))
+
         # do not predict on the last layer
         prediction_steps = tuple([
             step
@@ -240,9 +303,19 @@ class Network:
 
         self.learning_sequence = LearningSequence(
             prediction_steps=prediction_steps,
-            update_steps=update_steps,
-            learning_steps=tuple(learning_steps),  # type: ignore
+            update_steps=tuple(update_steps),
+            learning_steps=tuple(learning_steps),
         )
+
+        # Initialize Adam state for nodes that learn weights
+        if use_adam:
+            for node_idx, _ in learning_steps:
+                n_weights = len(
+                    self.edges[node_idx].value_parents  # type: ignore[arg-type]
+                )
+                self.attributes[node_idx]["adam_m"] = jnp.zeros(n_weights)
+                self.attributes[node_idx]["adam_v"] = jnp.zeros(n_weights)
+            self.attributes[-1]["adam_t"] = jnp.array(0)
 
         # create the learning propagation function
         # this function is used by scan to loop over predictors (x) and predictions (y)
@@ -253,17 +326,21 @@ class Network:
                 edges=self.edges,
                 inputs_x_idxs=inputs_x_idxs,
                 inputs_y_idxs=inputs_y_idxs,
+                use_adam=use_adam,
             )
 
         return self
 
     def fit(
         self,
-        x: np.ndarray,
-        y: np.ndarray,
-        inputs_x_idxs: tuple[int],
-        inputs_y_idxs: tuple[int],
+        x: ArrayLike,
+        y: ArrayLike,
+        inputs_x_idxs: tuple[int, ...],
+        inputs_y_idxs: tuple[int, ...],
         lr: Union[str, float] = 0.2,
+        learning_kind: str = "precision_weighted",
+        params: Optional[dict] = None,
+        record_trajectories: bool = False,
         overwrite: bool = True,
     ):
         """Add new observations.
@@ -283,7 +360,22 @@ class Network:
         inputs_y_idxs :
             The indexes of the nodes receiving the predictions (y).
         lr :
-            The kind of learning to use for the coupling strengths.
+            How the gradient is applied: a non-negative float for direct scaling, or
+            ``"adam"`` for the Adam optimiser.
+        learning_kind :
+            Gradient computation mode: ``"standard"``, ``"precision_weighted"``
+            (default), or ``"precision_ratio"``.
+        params :
+            Dictionary of Adam hyper-parameters (used only when ``lr="adam"``):
+            ``beta1`` (default 0.9), ``beta2`` (default 0.999), ``epsilon``
+            (default 1e-8), and ``lr`` (default 1e-3, the Adam step size).
+        record_trajectories :
+            If True, record the full node trajectories at every time step
+            (accessible via ``self.node_trajectories``). If False (default),
+            only the final state is kept, which significantly reduces memory
+            usage and speeds up training.
+        overwrite :
+            If `True`, create a new belief propagation function.
 
         """
         if x.ndim == 1:
@@ -292,9 +384,13 @@ class Network:
             y = y[:, jnp.newaxis]
 
         # generate the belief propagation function
-        if (self.scan_fn is None) and overwrite:
+        if (self.scan_fn is None) or overwrite:
             self = self.create_learning_propagation_fn(
-                inputs_x_idxs=inputs_x_idxs, inputs_y_idxs=inputs_y_idxs, lr=lr
+                inputs_x_idxs=inputs_x_idxs,
+                inputs_y_idxs=inputs_y_idxs,
+                lr=lr,
+                learning_kind=learning_kind,
+                params=params,
             )
 
         # wrap the inputs
@@ -303,21 +399,100 @@ class Network:
         # this is where the model loops over the whole input time series
         # at each time point, the node structure is traversed and beliefs are updated
         # using precision-weighted prediction errors
-        last_attributes, node_trajectories = scan(self.scan_fn, self.attributes, inputs)
+        if record_trajectories:
+            last_attributes, node_trajectories = scan(
+                self.scan_fn, self.attributes, inputs
+            )
+            self.node_trajectories = node_trajectories
+        else:
 
-        # belief trajectories
-        self.node_trajectories = node_trajectories
+            def _no_traj_step(attributes, inputs):
+                new_attributes, _ = self.scan_fn(attributes, inputs)
+                return new_attributes, None
+
+            last_attributes, _ = scan(_no_traj_step, self.attributes, inputs)
+            self.node_trajectories = None  # type: ignore[assignment]
+
         self.last_attributes = last_attributes
 
         return self
 
+    def predict(
+        self,
+        x: ArrayLike,
+        inputs_x_idxs: tuple[int, ...],
+        inputs_y_idxs: tuple[int, ...],
+    ) -> ArrayLike:
+        """Generate predictions from the network using only the prediction steps.
+
+        This method sets the predictor values on the top-layer nodes and runs the
+        prediction sequence (top-down) without any observation, posterior update, or
+        weight learning step. It returns the ``expected_mean`` of the bottom-layer
+        (target) nodes, which correspond to the network's predictions.
+
+        Parameters
+        ----------
+        x :
+            An array of predictor values with shape ``(n_samples, n_x_inputs)``.
+            Each row is fed to the nodes specified by ``inputs_x_idxs``.
+        inputs_x_idxs :
+            The indexes of the nodes receiving the predictors (top layer).
+        inputs_y_idxs :
+            The indexes of the target nodes whose ``expected_mean`` is returned
+            (bottom layer).
+
+        Returns
+        -------
+        predictions :
+            An array of shape ``(n_samples, len(inputs_y_idxs))`` containing the
+            ``expected_mean`` of each target node at every time step.
+
+        """
+        if x.ndim == 1:
+            x = x[:, jnp.newaxis]
+
+        # ensure the update sequence exists
+        if self.update_sequence is None:
+            self.update_sequence = get_update_sequence(
+                network=self, update_type=self.update_type
+            )
+
+        # keep only prediction steps that are not on the predictor nodes
+        prediction_steps = tuple(
+            step
+            for step in self.update_sequence.prediction_steps
+            if step[0] not in inputs_x_idxs
+        )
+
+        # build a per-sample function that only predicts
+        predict_fn = Partial(
+            predict_step,
+            prediction_steps=prediction_steps,
+            edges=self.edges,
+            inputs_x_idxs=inputs_x_idxs,
+            inputs_y_idxs=inputs_y_idxs,
+        )
+
+        # use last_attributes (post-training state) when available
+        init_attributes = (
+            self.last_attributes
+            if self.last_attributes is not None
+            else self.attributes
+        )
+
+        # vmap over x rows; attributes are shared (not batched)
+        predictions = vmap(predict_fn, in_axes=(None, 0))(init_attributes, x)
+
+        return predictions
+
     def input_data(
         self,
-        input_data: np.ndarray,
-        time_steps: Optional[np.ndarray] = None,
-        observed: Optional[tuple[np.ndarray, ...]] = None,
+        input_data: ArrayLike,
+        time_steps: Optional[ArrayLike] = None,
+        observed: Optional[tuple[ArrayLike, ...]] = None,
         input_idxs: Optional[tuple[int]] = None,
         rng_keys: Optional[random.PRNGKey] = None,
+        record_trajectories: bool = True,
     ):
         """Add new observations.
 
@@ -347,6 +522,11 @@ class Network:
         rng_keys :
             Optional. A random key for the random number generator. This is only used
             when an action function is provided.
+        record_trajectories :
+            If True (default), record the full node trajectories at every time
+            step (accessible via ``self.node_trajectories``).  If False, only
+            the final state is kept, which significantly reduces memory usage
+            and speeds up training.
 
         """
         if rng_keys is not None:
@@ -390,10 +570,20 @@ class Network:
         # this is where the model loops over the whole input time series
         # at each time point, the node structure is traversed and beliefs are updated
         # using precision-weighted prediction errors
-        last_attributes, node_trajectories = scan(self.scan_fn, self.attributes, inputs)
+        if record_trajectories:
+            last_attributes, node_trajectories = scan(
+                self.scan_fn, self.attributes, inputs
+            )
+            self.node_trajectories = node_trajectories
+        else:
 
-        # belief trajectories
-        self.node_trajectories = node_trajectories
+            def _no_traj_step(attributes, inputs):
+                new_attributes, _ = self.scan_fn(attributes, inputs)
+                return new_attributes, None
+
+            last_attributes, _ = scan(_no_traj_step, self.attributes, inputs)
+            self.node_trajectories = None  # type: ignore[assignment]
+
         self.last_attributes = last_attributes
 
         return self
@@ -626,12 +816,15 @@ class Network:
             "categorical-state",
             "continuous-state",
             "binary-state",
+            "volatile-state",
+            "constant-state",
         ]:
             raise ValueError(
                 (
                     "Invalid node type. Should be one of the following: "
                     "'dp-state', 'continuous-state', 'binary-state', "
-                    "'ef-state', or 'categorical-state'"
+                    "'ef-state', 'categorical-state', 'volatile-state', "
+                    "or 'constant-state'"
                 )
             )
 
@@ -659,6 +852,18 @@ class Network:
                 additional_parameters=additional_parameters,
                 coupling_fn=coupling_fn,
             )
+
+        elif kind == "volatile-state":
+            self = add_volatile_state(
+                network=self,
+                n_nodes=n_nodes,
+                value_parents=value_parents,
+                value_children=value_children,
+                node_parameters=node_parameters,
+                additional_parameters=additional_parameters,
+                coupling_fn=coupling_fn,
+            )
+
         elif kind == "binary-state":
             self = add_binary_state(
                 network=self,
@@ -691,6 +896,15 @@ class Network:
                 n_nodes=n_nodes,
                 node_parameters=node_parameters,
                 additional_parameters=additional_parameters,
+            )
+        elif kind == "constant-state":
+            self = add_constant_state(
+                network=self,
+                n_nodes=n_nodes,
+                value_children=value_children,
+                volatility_children=volatility_children,
+                node_parameters=node_parameters,
+                coupling_fn=coupling_fn,
             )
 
         return self
@@ -777,9 +991,9 @@ class Network:
 
     def add_edges(
         self,
-        kind="value",
-        parent_idxs=Union[int, list[int]],
-        children_idxs=Union[int, list[int]],
+        parent_idxs: Union[int, list[int]],
+        children_idxs: Union[int, list[int]],
+        kind: str = "value",
         coupling_strengths: Union[float, list[float], tuple[float]] = 1.0,
         coupling_fn: tuple[Optional[Callable], ...] = (None,),
     ) -> "Network":
@@ -787,12 +1001,12 @@ class Network:
 
         Parameters
         ----------
-        kind :
-            The kind of coupling, can be `"value"` or `"volatility"`.
         parent_idxs :
             The index(es) of the parent node(s).
         children_idxs :
             The index(es) of the children node(s).
+        kind :
+            The kind of coupling, can be `"value"` or `"volatility"`.
         coupling_strengths :
             The coupling strength betwen the parents and children.
         coupling_fn :

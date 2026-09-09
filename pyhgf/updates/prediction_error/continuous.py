@@ -7,10 +7,11 @@ from jax import jit
 from pyhgf.typing import Edges
 
 
-@partial(jit, static_argnames=("node_idx"))
+@partial(jit, static_argnames=("node_idx", "edges"))
 def continuous_node_value_prediction_error(
     attributes: dict,
     node_idx: int,
+    edges: Edges = (),
 ) -> dict:
     r"""Compute the value prediction error of a state node.
 
@@ -29,6 +30,8 @@ def continuous_node_value_prediction_error(
         The attributes of the probabilistic nodes.
     node_idx :
         Pointer to the value parent node that will be updated.
+    edges :
+        Unused. Kept for API compatibility with callers that pass edges.
 
     Returns
     -------
@@ -50,10 +53,6 @@ def continuous_node_value_prediction_error(
     value_prediction_error = (
         attributes[node_idx]["mean"] - attributes[node_idx]["expected_mean"]
     )
-
-    # divide by the number of value parents
-    if attributes[node_idx]["value_coupling_parents"] is not None:
-        value_prediction_error /= len(attributes[node_idx]["value_coupling_parents"])
 
     # send to the value parent node for later use in the update step
     attributes[node_idx]["temp"]["value_prediction_error"] = value_prediction_error
@@ -104,7 +103,7 @@ def continuous_node_volatility_prediction_error(
     volatility_prediction_error = (
         (attributes[node_idx]["expected_precision"] / attributes[node_idx]["precision"])
         + attributes[node_idx]["expected_precision"]
-        * (attributes[node_idx]["temp"]["value_prediction_error"]) ** 2
+        * (attributes[node_idx]["mean"] - attributes[node_idx]["expected_mean"]) ** 2
         - 1
     )
 
@@ -165,7 +164,7 @@ def continuous_node_prediction_error(
     # Store value prediction errors
     # -----------------------------
     attributes = continuous_node_value_prediction_error(
-        attributes=attributes, node_idx=node_idx
+        attributes=attributes, node_idx=node_idx, edges=edges
     )
 
     # Store volatility prediction errors

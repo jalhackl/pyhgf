@@ -1,20 +1,20 @@
 use crate::model::Network;
 
-
 /// Inject new observations into an input node
-/// 
-/// # Arguments
-/// * `network` - The main network containing the node.
-/// * `node_idx` - The input node index.
-/// * `observations` - The new observations.
-/// 
-/// # Returns
-/// * `network` - The network after message passing.
 pub fn observation_update(network: &mut Network, node_idx: usize, observations: f64) {
+    network.attributes.states[node_idx].mean = observations;
+}
 
-    if let Some(node) = network.attributes.floats.get_mut(&node_idx) {
-        if let Some(mean) = node.get_mut("mean") {
-            *mean = observations;
-        }
-    }
+/// Set predictor values on top-layer nodes.
+pub fn set_predictors(network: &mut Network, node_idx: usize, value: f64) {
+    let state = &mut network.attributes.states[node_idx];
+    state.mean = value;
+    state.expected_mean = value;
+}
+
+/// Set observation values on bottom-layer (target) nodes.
+pub fn set_observation(network: &mut Network, node_idx: usize, value: f64) {
+    let state = &mut network.attributes.states[node_idx];
+    state.mean = value;
+    state.observed = 1.0;
 }
